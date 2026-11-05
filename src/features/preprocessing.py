@@ -1,6 +1,5 @@
 """Cleaning and feature definitions for the UCI Bank Marketing dataset."""
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
 CATEGORICAL = [
     "job", "marital", "education", "default", "housing", "loan",
@@ -46,6 +45,7 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_split(df: pd.DataFrame, test_size: float = 0.2, seed: int = 42) -> pd.DataFrame:
     """Stratified, reproducible 80/20 split stored in a `split` column."""
+    from sklearn.model_selection import train_test_split
     train_idx, _ = train_test_split(
         df.index, test_size=test_size, random_state=seed, stratify=df[TARGET]
     )
