@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+mlruns/
+mlflow.db
+data/
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+.pytest_cache/
+.ruff_cache/

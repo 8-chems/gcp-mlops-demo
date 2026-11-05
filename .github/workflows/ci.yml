@@ -1,0 +1,32 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Unit tests (data validation, XGBoost training on a tiny dataset, API)
+        run: pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images (no push)
+        run: |
+          docker build -f training/Dockerfile -t training:ci .
+          docker build -f api/Dockerfile -t api:ci .
+          docker build -f dashboard/Dockerfile -t dashboard:ci .
+          docker build -t mlflow:ci mlflow_server

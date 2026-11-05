@@ -1,0 +1,74 @@
+name: CD
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/mlops
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+      - name: Build and push images
+        run: |
+          docker build -f training/Dockerfile -t $REGISTRY/training:${GITHUB_SHA} -t $REGISTRY/training:latest .
+          docker build -f api/Dockerfile -t $REGISTRY/api:${GITHUB_SHA} -t $REGISTRY/api:latest .
+          docker build -f dashboard/Dockerfile -t $REGISTRY/dashboard:${GITHUB_SHA} -t $REGISTRY/dashboard:latest .
+          docker push --all-tags $REGISTRY/training
+          docker push --all-tags $REGISTRY/api
+          docker push --all-tags $REGISTRY/dashboard
+
+      # Application-code deployment (a new MODEL is deployed separately: Airflow -> /reload)
+      - name: Update the pipeline Cloud Run Job
+        run: |
+          gcloud run jobs update mlops-pipeline-job --region $REGION \
+            --image $REGISTRY/training:${GITHUB_SHA}
+
+      - name: Deploy prediction API
+        run: |
+          MLFLOW_URL=$(gcloud run services describe mlflow --region $REGION --format='value(status.url)')
+          gcloud run deploy api --region $REGION \
+            --image $REGISTRY/api:${GITHUB_SHA} \
+            --service-account sa-api@${PROJECT_ID}.iam.gserviceaccount.com \
+            --no-allow-unauthenticated --min-instances 0 --memory 1Gi \
+            --set-env-vars GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION},MLFLOW_TRACKING_URI=${MLFLOW_URL},LOG_PREDICTIONS_TO_BQ=true
+
+      - name: Deploy Streamlit dashboard
+        run: |
+          MLFLOW_URL=$(gcloud run services describe mlflow --region $REGION --format='value(status.url)')
+          API_URL=$(gcloud run services describe api --region $REGION --format='value(status.url)')
+          gcloud run deploy dashboard --region $REGION \
+            --image $REGISTRY/dashboard:${GITHUB_SHA} \
+            --service-account sa-dashboard@${PROJECT_ID}.iam.gserviceaccount.com \
+            --allow-unauthenticated --min-instances 0 --memory 1Gi \
+            --set-env-vars GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION},MLFLOW_TRACKING_URI=${MLFLOW_URL},API_URL=${API_URL}
+
+      - name: Health checks
+        run: |
+          for svc in api dashboard; do
+            ready=$(gcloud run services describe $svc --region $REGION \
+              --format='value(status.conditions[0].status)')
+            echo "$svc Ready=$ready"; test "$ready" = "True"
+          done
+          DASH=$(gcloud run services describe dashboard --region $REGION --format='value(status.url)')
+          curl -fsS "$DASH/_stcore/health"

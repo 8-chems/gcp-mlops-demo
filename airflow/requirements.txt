@@ -1,0 +1,4 @@
+# Nothing to install in Cloud Composer: apache-airflow-providers-google and requests are
+# already provided by the Composer image. File kept for local Airflow testing.
+apache-airflow-providers-google
+requests
