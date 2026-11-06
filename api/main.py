@@ -4,8 +4,9 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from src.config import get_settings
@@ -31,7 +32,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Bank Marketing Prediction API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Bank Marketing Prediction API", version="1.1.0", lifespan=lifespan)
 
 
 class Customer(BaseModel):
@@ -88,20 +89,30 @@ def reload():
 
 
 @app.post("/predict", response_model=Prediction)
-def predict(customer: Customer):
+def predict(
+    customer: Customer,
+    x_submitted_by: Annotated[str | None, Header()] = None,
+):
+    """Predict for one customer.
+
+    The optional `X-Submitted-By` header carries the signed-in user's e-mail. It is sent by the
+    dashboard (the only caller allowed on this private service) and stored with the prediction.
+    """
     if state["model"] is None:
         raise HTTPException(status_code=503, detail="No model loaded yet (run the pipeline).")
+    submitted_by = (x_submitted_by or "").strip()[:254] or None
     record = customer.model_dump()
     proba = predict_proba(state["model"], [record])[0]
     pred = int(proba >= 0.5)
     log_event("model_prediction", component="api", model="xgboost",
-              model_version=state["version"], prediction=pred, probability=round(proba, 4))
+              model_version=state["version"], prediction=pred, probability=round(proba, 4),
+              submitted_by=submitted_by)
     if os.getenv("LOG_PREDICTIONS_TO_BQ", "false").lower() == "true":
-        _store_prediction(record, pred, proba)
+        _store_prediction(record, pred, proba, submitted_by)
     return Prediction(prediction=pred, probability=proba, model_version=state["version"])
 
 
-def _store_prediction(record: dict, pred: int, proba: float) -> None:
+def _store_prediction(record: dict, pred: int, proba: float, submitted_by: str | None) -> None:
     try:
         from src.utils.bigquery import insert_rows
 
@@ -114,6 +125,7 @@ def _store_prediction(record: dict, pred: int, proba: float) -> None:
             "prediction": pred,
             "probability": proba,
             "features": json.dumps(record),
+            "submitted_by": submitted_by,
         }], s.project_id)
         if errors:
             log_event("prediction_store_failed", severity="WARNING", component="api",

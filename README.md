@@ -18,6 +18,7 @@ Design decisions worth knowing:
 * **MLflow and the API are private Cloud Run services.** Callers send Google ID tokens
   (`src/utils/auth.py`); the proper service accounts get `roles/run.invoker`.
 * **No long-lived keys.** GitHub Actions authenticates with Workload Identity Federation.
+* **Dashboard access is role-based.** Visitors sign in with Google (Streamlit's built-in OIDC login, Step 10b). Normal users only see the *Predictions* form; admins also see the full dashboard and a *Pipeline admin* tab (run the Cloud Run Job, control the Airflow DAG). Roles come from e-mail allow-lists, and every admin function re-checks the role in Python.
 
 ```
 .
@@ -414,7 +415,7 @@ Test the API. First get an identity token, tell the API to load the champion mod
 
 ```powershell
 $TOKEN = gcloud auth print-identity-token
-curl.exe -s -X POST "$API_URL/reload" -H "Authorization: Bearer $TOKEN"
+curl.exe -s -X POST "$API_URL/reload" -H "Authorization: Bearer $TOKEN" -d "{}"
 curl.exe -s "$API_URL/health" -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -436,9 +437,490 @@ curl.exe -s -X POST "$API_URL/predict" -H "Authorization: Bearer $TOKEN" -H "Con
 
 The token lasts about an hour; rerun `$TOKEN = gcloud auth print-identity-token` to refresh it.
 
-> **Security note.** The dashboard is public to keep the demo simple. To restrict it, deploy it with `--no-allow-unauthenticated` (or put Identity-Aware Proxy in front). The API and MLflow stay private.
+> **Security note.** At this stage the dashboard is open to anyone with the URL. **Step 10b** adds Google sign-in and roles; do it before sharing the link. The API and MLflow stay private.
 
 Open the dashboard URL: *Data overview* (BigQuery), *Model experiments* (MLflow), *Model performance* (champion artifacts) and *Predictions* (calls the API).
+
+(Step 10b below replaces this basic dashboard with the version that has Google sign-in and roles.)
+
+## 10b. Google sign-in and roles (users and admins)
+
+| Who | Gets |
+|---|---|
+| Not signed in | A "Sign in with Google" page |
+| Signed in but not allowed | "Access restricted" |
+| **User** | The *Predictions* form only. Each submission is stored in BigQuery with their e-mail (`submitted_by`). |
+| **Admin** | All tabs plus *Pipeline admin*: run a Cloud Run Job step, trigger / pause / unpause the Airflow DAG |
+
+Roles: e-mails in `ADMIN_EMAILS` are admins. If `ALLOWED_EMAILS` is empty, any verified Google account is a normal user; otherwise only the listed e-mails are. Hiding tabs is not the security: each admin function checks the role again in Python (`require_admin()`).
+
+### 1. Add the `submitted_by` column in BigQuery (Terraform)
+
+```powershell
+. .\env.ps1
+cd infrastructure\terraform
+$old = '{ name = "features", type = "STRING", mode = "NULLABLE" },'
+$new = $old + "`n    " + '{ name = "submitted_by", type = "STRING", mode = "NULLABLE" },'
+(Get-Content main.tf -Raw).Replace($old, $new) | Set-Content main.tf -NoNewline -Encoding ascii
+Select-String -Path main.tf -Pattern "submitted_by"
+terraform apply
+cd ..\..
+```
+
+`Select-String` must show one line. The apply updates the table in place (adding a nullable column).
+
+### 2. Create the Google OAuth client (Google Cloud console)
+
+1. *APIs & Services → OAuth consent screen*: choose **External**, fill the app name and your support e-mail.
+2. Set the publishing status to **In production**. While it is "Testing", only listed test users can sign in. The default scopes (`openid`, `email`, `profile`) are the ones Streamlit requests.
+3. *APIs & Services → Credentials → Create credentials → OAuth client ID → Web application*.
+4. Under **Authorized redirect URIs** add the output of this command, exactly:
+
+```powershell
+$DASH_URL = gcloud run services describe dashboard --region $REGION --format "value(status.url)"
+"$DASH_URL/oauth2callback"
+```
+
+5. Copy the **client ID** and **client secret**.
+
+### 3. Store the sign-in settings in Secret Manager
+
+```powershell
+$GOOGLE_CLIENT_ID     = "PASTE_CLIENT_ID"
+$GOOGLE_CLIENT_SECRET = "PASTE_CLIENT_SECRET"
+$b = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+$COOKIE_SECRET = [Convert]::ToBase64String($b)
+
+@"
+[auth]
+redirect_uri = "$DASH_URL/oauth2callback"
+cookie_secret = "$COOKIE_SECRET"
+client_id = "$GOOGLE_CLIENT_ID"
+client_secret = "$GOOGLE_CLIENT_SECRET"
+server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+"@ | Set-Content secrets.toml -Encoding ascii
+
+gcloud secrets create dashboard-auth-secrets --data-file=secrets.toml
+Remove-Item secrets.toml
+gcloud secrets add-iam-policy-binding dashboard-auth-secrets --member "serviceAccount:$SA_DASHBOARD" --role roles/secretmanager.secretAccessor
+```
+
+Never keep or commit `secrets.toml`. To change the settings later: `gcloud secrets versions add dashboard-auth-secrets --data-file=secrets.toml`, then redeploy.
+
+### 4. Update the code
+
+**Dependencies and Docker command** (Streamlit's login needs Authlib; the admin tab needs the Cloud Run client; Streamlit enables CORS/XSRF protection by itself once auth is configured, so remove the two flags):
+
+```powershell
+@'
+streamlit>=1.42.0
+Authlib>=1.3.2
+google-cloud-run>=0.10.0
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==18.1.0
+db-dtypes>=1.3.0
+mlflow-skinny==2.22.0
+google-cloud-bigquery>=3.25.0
+google-auth>=2.30.0
+requests>=2.32.0
+'@ | Set-Content dashboard\requirements.txt -Encoding ascii
+
+(Get-Content dashboard\Dockerfile -Raw).Replace(' --server.enableCORS=false --server.enableXsrfProtection=false', '') | Set-Content dashboard\Dockerfile -NoNewline -Encoding ascii
+New-Item dashboard\__init__.py -ItemType File -Force | Out-Null
+```
+
+**API:** replace `api\main.py` by the new `main.py` (it reads the `X-Submitted-By` header and stores it in `submitted_by`).
+
+**Dashboard files.** Create or replace these three files (click to expand):
+
+<details>
+<summary><code>dashboard\auth.py</code> (new)</summary>
+
+```python
+"""Google sign-in (Streamlit OIDC) and role resolution (user / admin)."""
+import os
+
+import streamlit as st
+
+
+def _emails(var: str) -> set[str]:
+    return {e.strip().lower() for e in os.getenv(var, "").split(",") if e.strip()}
+
+
+def require_login() -> str:
+    """Show the sign-in page until the visitor is signed in; return their verified e-mail."""
+    if not st.user.is_logged_in:
+        st.title("MLOps demo - Bank Marketing")
+        st.write("Sign in with your Google account to continue.")
+        st.button("Sign in with Google", on_click=st.login)
+        st.stop()
+    email = (getattr(st.user, "email", "") or "").lower()
+    if not email or not getattr(st.user, "email_verified", False):
+        st.error("Your Google e-mail is missing or not verified.")
+        st.button("Sign out", on_click=st.logout)
+        st.stop()
+    return email
+
+
+def role_of(email: str) -> str | None:
+    """'admin' if listed in ADMIN_EMAILS; 'user' if allowed; None if not allowed.
+
+    ALLOWED_EMAILS empty means: any verified Google account is a normal user."""
+    if email in _emails("ADMIN_EMAILS"):
+        return "admin"
+    allowed = _emails("ALLOWED_EMAILS")
+    return "user" if not allowed or email in allowed else None
+
+
+def require_admin() -> str:
+    """Call this INSIDE every admin function, not only when drawing the UI."""
+    email = (getattr(st.user, "email", "") or "").lower()
+    if not st.user.is_logged_in or role_of(email) != "admin":
+        raise PermissionError("Admin only")
+    return email
+```
+
+</details>
+
+<details>
+<summary><code>dashboard\admin.py</code> (new)</summary>
+
+```python
+"""Admin actions: run the Cloud Run Job and control the Airflow DAG (admins only)."""
+import os
+from datetime import datetime, timezone
+
+import google.auth
+from google.auth.transport.requests import AuthorizedSession
+from google.cloud import run_v2
+
+from dashboard.auth import require_admin
+from src.config import get_settings
+from src.utils.logging import log_event
+
+DAG_ID = "xgboost_training_pipeline"
+
+
+def run_job_step(step: str, run_id: str) -> str:
+    """Start one execution of the pipeline job for a single step; returns the operation name."""
+    admin = require_admin()
+    s = get_settings()
+    job = os.getenv("PIPELINE_JOB_NAME", "mlops-pipeline-job")
+    name = f"projects/{s.project_id}/locations/{s.region}/jobs/{job}"
+    override = run_v2.RunJobRequest.Overrides.ContainerOverride(args=[step, "--run-id", run_id])
+    request = run_v2.RunJobRequest(
+        name=name, overrides=run_v2.RunJobRequest.Overrides(container_overrides=[override])
+    )
+    operation = run_v2.JobsClient().run_job(request=request)
+    log_event("admin_job_triggered", component="dashboard", user=admin, step=step, run_id=run_id)
+    return operation.operation.name
+
+
+def _airflow():
+    base = os.getenv("AIRFLOW_URL", "").rstrip("/")
+    if not base:
+        raise RuntimeError("AIRFLOW_URL is not configured (create Composer first, see Step 11).")
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    return AuthorizedSession(creds), base, os.getenv("AIRFLOW_API", "v1")
+
+
+def trigger_dag() -> dict:
+    admin = require_admin()
+    session, base, version = _airflow()
+    body: dict = {"conf": {}}
+    if version == "v2":  # Airflow 3 requires a logical date
+        body["logical_date"] = datetime.now(timezone.utc).isoformat()
+    response = session.post(f"{base}/api/{version}/dags/{DAG_ID}/dagRuns", json=body, timeout=90)
+    response.raise_for_status()
+    log_event("admin_dag_triggered", component="dashboard", user=admin)
+    return response.json()
+
+
+def set_dag_paused(paused: bool) -> None:
+    admin = require_admin()
+    session, base, version = _airflow()
+    response = session.patch(
+        f"{base}/api/{version}/dags/{DAG_ID}",
+        params={"update_mask": "is_paused"},
+        json={"is_paused": paused},
+        timeout=90,
+    )
+    response.raise_for_status()
+    log_event("admin_dag_paused", component="dashboard", user=admin, paused=paused)
+```
+
+</details>
+
+<details>
+<summary><code>dashboard\app.py</code> (replaces the existing file)</summary>
+
+```python
+"""Streamlit dashboard: Google sign-in, role-based tabs (user / admin)."""
+import os
+import tempfile
+
+import pandas as pd
+import requests
+import streamlit as st
+from mlflow.tracking import MlflowClient
+
+from dashboard.auth import require_login, role_of
+from src.config import get_settings
+from src.features.preprocessing import FEATURES, TARGET
+from src.utils.auth import auth_headers, configure_mlflow_auth
+from src.utils.logging import log_event
+
+st.set_page_config(page_title="MLOps demo - Bank Marketing", layout="wide")
+S = get_settings()
+API_URL = os.getenv("API_URL", "http://localhost:8080").rstrip("/")
+AIRFLOW_URL = os.getenv("AIRFLOW_URL", "").rstrip("/")
+
+# ---- sign-in and role --------------------------------------------------------------------
+email = require_login()
+role = role_of(email)
+if role is None:
+    st.error("Access restricted. Ask an admin to add your e-mail.")
+    st.button("Sign out", on_click=st.logout)
+    st.stop()
+st.sidebar.write(f"Signed in as **{email}** ({role})")
+st.sidebar.button("Sign out", on_click=st.logout)
+
+CHOICES = {
+    "job": ["admin.", "blue-collar", "entrepreneur", "housemaid", "management", "retired",
+            "self-employed", "services", "student", "technician", "unemployed", "unknown"],
+    "marital": ["married", "single", "divorced", "unknown"],
+    "education": ["basic.4y", "basic.6y", "basic.9y", "high.school", "illiterate",
+                  "professional.course", "university.degree", "unknown"],
+    "default": ["no", "yes", "unknown"], "housing": ["no", "yes", "unknown"],
+    "loan": ["no", "yes", "unknown"], "contact": ["cellular", "telephone"],
+    "month": ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"],
+    "day_of_week": ["mon", "tue", "wed", "thu", "fri"],
+    "poutcome": ["nonexistent", "failure", "success"],
+}
+
+
+@st.cache_data(ttl=600)
+def load_training_data() -> pd.DataFrame:
+    from src.utils.bigquery import read_table
+
+    return read_table(S.training_table_id, S.project_id)
+
+
+def mlflow_client() -> MlflowClient:
+    configure_mlflow_auth()
+    return MlflowClient(tracking_uri=S.mlflow_tracking_uri)
+
+
+@st.cache_data(ttl=120)
+def load_runs() -> pd.DataFrame:
+    client = mlflow_client()
+    exp = client.get_experiment_by_name(S.experiment_name)
+    if exp is None:
+        return pd.DataFrame()
+    runs = client.search_runs([exp.experiment_id], order_by=["attributes.start_time DESC"],
+                              max_results=100)
+    return pd.DataFrame([{
+        "run": r.info.run_name, "run_id": r.info.run_id[:8],
+        "pipeline_run_id": r.data.tags.get("pipeline_run_id"),
+        **{k: r.data.params.get(k) for k in ("max_depth", "learning_rate", "n_estimators")},
+        **{k: round(v, 4) for k, v in r.data.metrics.items()},
+    } for r in runs])
+
+
+st.title("MLOps demo - Bank Marketing (XGBoost)")
+names = ["Predictions"] if role == "user" else [
+    "Data overview", "Model experiments", "Model performance", "Predictions", "Pipeline admin"]
+T = dict(zip(names, st.tabs(names), strict=True))
+
+if "Data overview" in T:
+    with T["Data overview"]:
+        try:
+            df = load_training_data()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Rows", f"{len(df):,}")
+            c2.metric("Features", len(FEATURES))
+            c3.metric("Missing values", int(df.isna().sum().sum()))
+            c4.metric("Positive rate", f"{df[TARGET].mean():.1%}")
+            st.subheader("Target distribution")
+            st.bar_chart(df[TARGET].value_counts().rename({0: "no", 1: "yes"}))
+            st.subheader("Data quality")
+            st.write(f"Duplicate rows: {int(df.drop(columns=['split']).duplicated().sum())}")
+            st.write(df["split"].value_counts().rename("rows per split"))
+            st.dataframe(df.head(50))
+        except Exception as exc:  # noqa: BLE001
+            log_event("dashboard_error", severity="ERROR", component="dashboard", tab="data",
+                      error=repr(exc))
+            st.error(f"Could not load BigQuery data: {exc}")
+
+if "Model experiments" in T:
+    with T["Model experiments"]:
+        try:
+            runs = load_runs()
+            if runs.empty:
+                st.info("No MLflow runs yet. Execute the pipeline first.")
+            else:
+                st.dataframe(runs, use_container_width=True)
+                st.bar_chart(runs.set_index("run")[["roc_auc", "f1", "accuracy"]])
+        except Exception as exc:  # noqa: BLE001
+            log_event("dashboard_error", severity="ERROR", component="dashboard",
+                      tab="experiments", error=repr(exc))
+            st.error(f"Could not reach MLflow: {exc}")
+
+if "Model performance" in T:
+    with T["Model performance"]:
+        try:
+            client = mlflow_client()
+            mv = client.get_model_version_by_alias(S.model_name, S.model_alias)
+            run = client.get_run(mv.run_id)
+            st.write(f"Champion: **{S.model_name} v{mv.version}** (run `{mv.run_id[:8]}`)")
+            metric_names = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+            for col, m in zip(st.columns(5), metric_names, strict=True):
+                col.metric(m, f"{run.data.metrics.get(m, float('nan')):.3f}")
+            with tempfile.TemporaryDirectory() as tmp:
+                images = ["confusion_matrix", "roc_curve", "feature_importance"]
+                for col, name in zip(st.columns(3), images, strict=True):
+                    path = client.download_artifacts(mv.run_id, f"evaluation/{name}.png", tmp)
+                    col.image(path, caption=name.replace("_", " "))
+        except Exception as exc:  # noqa: BLE001
+            log_event("dashboard_error", severity="ERROR", component="dashboard",
+                      tab="performance", error=repr(exc))
+            st.warning(f"No champion model available yet: {exc}")
+
+with T["Predictions"]:
+    st.write("Will this customer subscribe to a term deposit?")
+    with st.form("predict"):
+        c1, c2, c3 = st.columns(3)
+        payload = {}
+        for i, (name, opts) in enumerate(CHOICES.items()):
+            payload[name] = [c1, c2, c3][i % 3].selectbox(name, opts)
+        payload["age"] = c1.number_input("age", 16, 110, 40)
+        payload["campaign"] = c2.number_input("campaign", 1, 60, 2)
+        payload["pdays"] = c3.number_input("pdays (999 = never)", 0, 999, 999)
+        payload["previous"] = c1.number_input("previous", 0, 20, 0)
+        payload["emp_var_rate"] = c2.number_input("emp_var_rate", -4.0, 2.0, 1.1)
+        payload["cons_price_idx"] = c3.number_input("cons_price_idx", 90.0, 96.0, 93.9)
+        payload["cons_conf_idx"] = c1.number_input("cons_conf_idx", -55.0, -25.0, -36.4)
+        payload["euribor3m"] = c2.number_input("euribor3m", 0.5, 5.5, 4.8)
+        payload["nr_employed"] = c3.number_input("nr_employed", 4900.0, 5300.0, 5191.0)
+        submitted = st.form_submit_button("Predict")
+    if submitted:
+        try:
+            r = requests.post(
+                f"{API_URL}/predict", json=payload,
+                headers={**auth_headers(API_URL), "X-Submitted-By": email}, timeout=60)
+            r.raise_for_status()
+            out = r.json()
+            label = "WILL subscribe" if out["prediction"] else "will NOT subscribe"
+            st.success(f"Prediction: customer {label} (probability {out['probability']:.1%}, "
+                       f"model v{out['model_version']}). Your submission was recorded.")
+        except Exception as exc:  # noqa: BLE001
+            log_event("api_connection_failure", severity="ERROR", component="dashboard",
+                      error=repr(exc))
+            st.error(f"API call failed: {exc}")
+
+if "Pipeline admin" in T:
+    with T["Pipeline admin"]:
+        from dashboard import admin
+
+        st.subheader("Cloud Run Job")
+        step = st.selectbox("Job step", ["extract", "validate", "preprocess", "load",
+                                          "train", "evaluate", "register"])
+        run_id = st.text_input("Run id", value="manual")
+        if st.button("Run this step"):
+            try:
+                st.success(f"Started: {admin.run_job_step(step, run_id)}")
+            except Exception as exc:  # noqa: BLE001
+                log_event("dashboard_error", severity="ERROR", component="dashboard",
+                          tab="admin", error=repr(exc))
+                st.error(f"Could not start the job: {exc}")
+
+        st.subheader("Airflow")
+        if AIRFLOW_URL:
+            st.markdown(f"[Open the Airflow UI]({AIRFLOW_URL})")
+        a, b, c = st.columns(3)
+        try:
+            if a.button("Trigger DAG run"):
+                st.json(admin.trigger_dag())
+            if b.button("Pause DAG"):
+                admin.set_dag_paused(True)
+                st.success("DAG paused")
+            if c.button("Unpause DAG"):
+                admin.set_dag_paused(False)
+                st.success("DAG unpaused")
+        except Exception as exc:  # noqa: BLE001
+            log_event("dashboard_error", severity="ERROR", component="dashboard", tab="admin",
+                      error=repr(exc))
+            st.error(f"Airflow call failed: {exc}")
+```
+
+</details>
+
+Check the code before building: `ruff check .` (it must pass, as CI runs it too).
+
+### 5. Permissions for the admin features
+
+```powershell
+# run the Cloud Run Job (scoped to this job) and act as the job's service account
+gcloud run jobs add-iam-policy-binding $JOB --region $REGION --member "serviceAccount:$SA_DASHBOARD" --role roles/run.developer
+gcloud iam service-accounts add-iam-policy-binding $SA_TRAINING --member "serviceAccount:$SA_DASHBOARD" --role roles/iam.serviceAccountUser
+```
+
+If starting a job later fails with a permission error mentioning overrides, the role you granted is missing the permission to run a job with overrides.
+
+### 6. Build, push and redeploy
+
+```powershell
+. .\env.ps1
+Add-Content env.ps1 "`$ADMIN_EMAILS = '$MY_EMAIL'"
+. .\env.ps1                    # ADMIN_EMAILS: one e-mail, or "a@gmail.com,b@gmail.com"
+
+docker build --platform linux/amd64 -t "$REGISTRY/api:latest" -f api/Dockerfile .
+docker build --platform linux/amd64 -t "$REGISTRY/dashboard:latest" -f dashboard/Dockerfile .
+docker push "$REGISTRY/api:latest"
+docker push "$REGISTRY/dashboard:latest"
+
+gcloud run deploy api --region $REGION --image "$REGISTRY/api:latest"
+```
+
+`gcloud` splits `--set-env-vars` on commas, so a list of e-mails needs a custom separator (`^;^`). Leave `AIRFLOW_URL` empty until Composer exists (Step 11 fills it):
+
+```powershell
+$AIRFLOW_URL = ""
+$AIRFLOW_API = "v1"
+$DASH_ENV = "^;^GCP_PROJECT_ID=${PROJECT_ID};GCP_REGION=${REGION};MLFLOW_TRACKING_URI=${MLFLOW_URL};API_URL=${API_URL};ADMIN_EMAILS=${ADMIN_EMAILS};AIRFLOW_URL=${AIRFLOW_URL};AIRFLOW_API=${AIRFLOW_API};PIPELINE_JOB_NAME=${JOB}"
+
+gcloud run deploy dashboard --region $REGION --image "$REGISTRY/dashboard:latest" `
+  --service-account $SA_DASHBOARD --allow-unauthenticated --min-instances 0 --memory 1Gi `
+  --set-env-vars $DASH_ENV `
+  --set-secrets "/app/.streamlit/secrets.toml=dashboard-auth-secrets:latest"
+```
+
+The service stays public at the Cloud Run level on purpose: the app itself does the Google sign-in. To restrict normal users to invited people, add `;ALLOWED_EMAILS=a@gmail.com,b@gmail.com` to `$DASH_ENV`.
+
+### 7. Keep CD from erasing these settings
+
+The CD workflow deploys the dashboard with `--set-env-vars`, which **replaces all** environment variables and would erase `ADMIN_EMAILS` and the others on the next push. Switch it to `--update-env-vars` (the secret mount is left untouched):
+
+```powershell
+$old = '--set-env-vars GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION},MLFLOW_TRACKING_URI=${MLFLOW_URL},API_URL=${API_URL}'
+$new = $old.Replace('--set-env-vars', '--update-env-vars')
+(Get-Content .github\workflows\cd.yml -Raw).Replace($old, $new) | Set-Content .github\workflows\cd.yml -NoNewline -Encoding ascii
+Select-String -Path .github\workflows\cd.yml -Pattern "update-env-vars"
+```
+
+### 8. Test it
+
+1. Open the dashboard URL, click **Sign in with Google** with your admin account: all five tabs appear.
+2. Open a private window and sign in with a second Google account: only *Predictions* appears.
+3. Submit a prediction as the second account, then check who submitted it:
+
+```powershell
+bq query --use_legacy_sql=false "SELECT timestamp, submitted_by, prediction FROM mlops_demo.prediction_results ORDER BY timestamp DESC LIMIT 5"
+```
+
+4. As admin, run a job step from *Pipeline admin* and look for `admin_job_triggered` in Logs Explorer (Step 13).
 
 ## 11. Airflow on Cloud Composer (temporary environment)
 
@@ -468,6 +950,19 @@ gcloud composer environments describe $COMPOSER_ENV --location $REGION --format 
 Open the Airflow UI URL to watch the 9 tasks: `extract_data → validate_data → preprocess_data → load_bigquery → trigger_training → evaluate_model → register_model → reload_api → pipeline_report`. Trigger it a second time: the new model is only promoted if its ROC-AUC beats the champion.
 
 (The quoted `"--"` is passed to `gcloud` untouched; PowerShell would otherwise interpret it.)
+
+**Connect the dashboard's *Pipeline admin* tab to Airflow.** Check your Airflow major version first: Airflow 2 uses REST API `v1`, Airflow 3 uses `v2`.
+
+```powershell
+gcloud composer environments describe $COMPOSER_ENV --location $REGION --format "value(config.softwareConfig.imageVersion)"
+$AIRFLOW_URL = gcloud composer environments describe $COMPOSER_ENV --location $REGION --format "value(config.airflowUri)"
+$AIRFLOW_API = "v1"          # use "v2" if the image version above starts with composer-3-airflow-3
+
+gcloud projects add-iam-policy-binding $PROJECT_ID --member "serviceAccount:$SA_DASHBOARD" --role roles/composer.user
+gcloud run services update dashboard --region $REGION --update-env-vars "AIRFLOW_URL=${AIRFLOW_URL},AIRFLOW_API=${AIRFLOW_API}"
+```
+
+The first API call creates an Airflow user for the dashboard's service account (default Airflow role `Op`). Detailed Airflow configuration (variables, connections, schedules) stays in the Airflow UI: give your admins `roles/composer.user` on the project so they can open it with their Google account. A DAG's schedule lives in the DAG file, so changing it means re-importing the file. For a simple recurring run without Composer, Cloud Scheduler can run the Cloud Run Job directly.
 
 ## 12. CI/CD with GitHub Actions
 
@@ -550,7 +1045,7 @@ gcloud run services logs read mlflow --region $REGION --limit 50
 gcloud run jobs executions list --job $JOB --region $REGION
 ```
 
-Events emitted: `pipeline_step_started/completed/failure`, `data_extracted`, `data_validated`, `data_preprocessed`, `data_loaded_bigquery`, `model_training_started/completed`, `model_evaluation_passed/failed`, `model_registered`, `model_loaded`, `model_prediction`, `api_connection_failure`, `dashboard_error`, `pipeline_report`, `api_reloaded`.
+Events emitted: `pipeline_step_started/completed/failure`, `data_extracted`, `data_validated`, `data_preprocessed`, `data_loaded_bigquery`, `model_training_started/completed`, `model_evaluation_passed/failed`, `model_registered`, `model_loaded`, `model_prediction`, `api_connection_failure`, `dashboard_error`, `pipeline_report`, `api_reloaded`, and the admin actions `admin_job_triggered`, `admin_dag_triggered`, `admin_dag_paused` (each with the admin's e-mail in `user`). `model_prediction` also carries `submitted_by`.
 
 Optional alert on pipeline failures (log-based metric, then an alert policy in *Monitoring → Alerting*):
 
@@ -560,7 +1055,7 @@ gcloud logging metrics create pipeline_failures --description "Failed pipeline s
 
 ## 14. Final end-to-end check (definition of success)
 
-1. Push a change: CI runs the tests. 2. Merge: CD deploys. 3. Trigger the DAG in Airflow. 4. The job trains 3 XGBoost models and MLflow records parameters, metrics and artifacts. 5. The best model is registered and promoted to `champion`. 6. `reload_api` makes the API serve it (`GET /model-info`). 7. The dashboard shows experiments and answers predictions. 8. Logs Explorer shows the whole run.
+1. Push a change: CI runs the tests. 2. Merge: CD deploys. 3. Trigger the DAG in Airflow. 4. The job trains 3 XGBoost models and MLflow records parameters, metrics and artifacts. 5. The best model is registered and promoted to `champion`. 6. `reload_api` makes the API serve it (`GET /model-info`). 7. The dashboard shows experiments and answers predictions. 8. Logs Explorer shows the whole run. 9. A normal user sees only *Predictions*, an admin sees all tabs and can start a job step.
 
 ## 15. Cleanup (do not skip: Composer and Cloud SQL bill continuously)
 
@@ -569,13 +1064,14 @@ gcloud logging metrics create pipeline_failures --description "Failed pipeline s
 gcloud composer environments delete $COMPOSER_ENV --location $REGION --quiet
 foreach ($s in "dashboard","api","mlflow") { gcloud run services delete $s --region $REGION --quiet }
 gcloud run jobs delete $JOB --region $REGION --quiet
+gcloud secrets delete dashboard-auth-secrets --quiet
 gcloud logging metrics delete pipeline_failures --quiet
 cd infrastructure\terraform
 terraform destroy
 cd ..\..
 ```
 
-Composer also creates a bucket named like `europe-west1-mlops-demo-*`: delete it if it remains (`gcloud storage rm -r gs://BUCKET_NAME`). To delete everything at once: `gcloud projects delete $PROJECT_ID`.
+Composer also creates a bucket named like `europe-west1-mlops-demo-*`: delete it if it remains (`gcloud storage rm -r gs://BUCKET_NAME`). Also delete the OAuth client in the console (*APIs & Services → Credentials*). To delete everything at once: `gcloud projects delete $PROJECT_ID`.
 
 To pause only the expensive parts between sessions: delete Composer (recreate in about 25 minutes) and stop Cloud SQL (`gcloud sql instances patch mlflow-pg --activation-policy=NEVER`, back with `--activation-policy=ALWAYS`).
 
@@ -594,6 +1090,7 @@ To pause only the expensive parts between sessions: delete Composer (recreate in
 | `docker`: `failed to connect to the docker API` | Docker Desktop is not running. Start it and wait until `docker info` works. If it will not start: `wsl --install`, `wsl --update`, enable virtualization in BIOS. |
 | MLflow revision fails with `exec /entrypoint.sh: no such file or directory` | Windows line endings in `mlflow_server\entrypoint.sh`. Convert with the command in Step 1, rebuild and push the image, redeploy. |
 | `mlflow ui` says `unable to open database file` | Wrong SQLite path. `cd` into the smoke-test folder and use `sqlite:///mlflow.db` (Step 1). |
+| `411 Length Required` on `POST /reload` | A POST without a body has no `Content-Length` header, which Google's front end rejects. Add `-d "{}"` to the `curl.exe` command (done in Step 10). |
 | `403 Forbidden` calling MLflow/API | Missing `roles/run.invoker` for the caller (Steps 7, 8, 10), or an expired ID token (refresh `$TOKEN`). |
 | MLflow revision fails to start | `gcloud run services logs read mlflow --region $REGION`: check the Cloud SQL instance is `RUNNABLE`, the secret exists, and `--add-cloudsql-instances` is set. |
 | `evaluate` fails with `ThresholdNotMet` | Model below `MIN_ROC_AUC`. Lower it: `gcloud run jobs update $JOB --region $REGION --update-env-vars MIN_ROC_AUC=0.7`. |
@@ -601,6 +1098,14 @@ To pause only the expensive parts between sessions: delete Composer (recreate in
 | DAG not shown in Airflow | Wait 2-3 min; check *DAG import errors* in the UI; ensure the Composer env variables exist. |
 | `CloudRunExecuteJobOperator` 403 | `sa-airflow` needs `roles/run.developer` and `serviceAccountUser` on `sa-training` (Terraform grants both). |
 | CD cannot authenticate | Check the secrets (`gh secret list`) and that `github_repo` in `terraform.tfvars` equals `$GITHUB_REPO` exactly; if not, fix it and run `terraform apply` again. |
+| Dashboard crashes with `ModuleNotFoundError: No module named 'sklearn'` | `src/features/preprocessing.py` must import scikit-learn only inside `add_split` (the dashboard image does not install it). |
+| `redirect_uri_mismatch` when signing in | The redirect URI in the OAuth client must be exactly `<dashboard URL>/oauth2callback` (Step 10b, part 2) and match `redirect_uri` in the secret. |
+| Google says the app is blocked or only test users can sign in | OAuth consent screen is still in *Testing*: set it to *In production* (Step 10b, part 2). |
+| Dashboard shows an auth configuration error after deploy | The secret file is not mounted: check `--set-secrets "/app/.streamlit/secrets.toml=dashboard-auth-secrets:latest"` and that `sa-dashboard` has `secretAccessor` on the secret. |
+| Sign-in worked before, broken after a push to `main` | CD replaced the dashboard environment variables. Apply Step 10b part 7 (`--update-env-vars`), then redeploy as in part 6. |
+| Prediction works but `submitted_by` is empty / insert fails | The BigQuery column is missing (Step 10b part 1) or the API still runs the old `main.py`: rebuild and redeploy the API. |
+| *Pipeline admin*: `PermissionDenied` when starting a job | `sa-dashboard` lacks the job permissions or `serviceAccountUser` on `sa-training` (Step 10b part 5). |
+| *Pipeline admin*: Airflow call fails (401/403/404) | `AIRFLOW_URL` / `AIRFLOW_API` wrong (check Airflow 2 vs 3), `roles/composer.user` missing, or Composer was deleted. |
 | BigQuery `Access Denied` | Wait about 1 minute after `terraform apply`; IAM changes propagate with a delay. |
 
 ## Tests

@@ -13,6 +13,49 @@ from src.utils.auth import auth_headers, configure_mlflow_auth
 from src.utils.logging import log_event
 
 st.set_page_config(page_title="MLOps demo - Bank Marketing", layout="wide")
+
+
+from dashboard.auth import require_login, role_of
+
+email = require_login()
+role = role_of(email)
+if role is None:
+    st.error("Access restricted. Ask an admin to add your e-mail.")
+    st.button("Sign out", on_click=st.logout)
+    st.stop()
+st.sidebar.write(f"{email} ({role})")
+st.sidebar.button("Sign out", on_click=st.logout)
+
+names = ["Predictions"] if role == "user" else [
+    "Data overview", "Model experiments", "Model performance", "Predictions", "Pipeline admin"]
+T = dict(zip(names, st.tabs(names), strict=True))
+
+if "Data overview" in T:
+    with T["Data overview"]:
+        ...   # existing block
+# same pattern for the other existing tabs
+
+with T["Predictions"]:
+    ...       # existing form, but send the e-mail to the API:
+    # headers={**auth_headers(API_URL), "X-Submitted-By": email}
+
+if "Pipeline admin" in T:
+    with T["Pipeline admin"]:
+        from dashboard import admin
+        step = st.selectbox("Job step", ["extract", "validate", "preprocess", "load",
+                                          "train", "evaluate", "register"])
+        run_id = st.text_input("Run id", value="manual")
+        if st.button("Run this step"):
+            st.success(f"Started: {admin.run_job_step(step, run_id)}")
+        if st.button("Trigger Airflow DAG"):
+            st.json(admin.trigger_dag())
+        c1, c2 = st.columns(2)
+        if c1.button("Pause DAG"):
+            admin.set_dag_paused(True)
+        if c2.button("Unpause DAG"):
+            admin.set_dag_paused(False)
+            
+
 S = get_settings()
 API_URL = os.getenv("API_URL", "http://localhost:8080").rstrip("/")
 
