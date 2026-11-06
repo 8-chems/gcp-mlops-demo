@@ -10,7 +10,7 @@
     - Grants the dashboard service account read access
 
 .PARAMETER GoogleClientId
-    Google OAuth 2.0 client ID  (from GCP Console → APIs & Services → Credentials)
+    Google OAuth 2.0 client ID  (from GCP Console -> APIs & Services -> Credentials)
 
 .PARAMETER GoogleClientSecret
     Google OAuth 2.0 client secret
@@ -44,40 +44,51 @@ param (
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# Note: native executables (gcloud) ignore ErrorActionPreference.
+# We check $LASTEXITCODE manually after every gcloud call.
 
 # ── 1. Generate a 32-byte random cookie secret ────────────────────────────────
 $bytes = New-Object byte[] 32
 [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
 $cookieSecret = [Convert]::ToBase64String($bytes)
 
-# ── 2. Build secrets.toml (in memory → temp file) ────────────────────────────
-$tempFile = [System.IO.Path]::GetTempFileName()   # random path outside repo
-try {
-    @"
-[auth]
-redirect_uri              = "$($DashUrl.TrimEnd('/'))/oauth2callback"
-cookie_secret             = "$cookieSecret"
-client_id                 = "$GoogleClientId"
-client_secret             = "$GoogleClientSecret"
-server_metadata_url       = "https://accounts.google.com/.well-known/openid-configuration"
-"@ | Set-Content $tempFile -Encoding ascii
+# ── 2. Write secrets.toml to a temp file outside the repo ────────────────────
+$tempFile = [System.IO.Path]::GetTempFileName()
 
+$tomlContent = @"
+[auth]
+redirect_uri          = "$($DashUrl.TrimEnd('/'))/oauth2callback"
+cookie_secret         = "$cookieSecret"
+client_id             = "$GoogleClientId"
+client_secret         = "$GoogleClientSecret"
+server_metadata_url   = "https://accounts.google.com/.well-known/openid-configuration"
+"@
+
+try {
+    Set-Content -Path $tempFile -Value $tomlContent -Encoding ascii
     Write-Host "[1/3] secrets.toml written to temp file"
 
-    # ── 3. Create (or update) the Secret Manager secret ──────────────────────
-    $existingSecrets = gcloud secrets list --filter="name:$SecretName" --format="value(name)" 2>$null
-    if ($existingSecrets) {
-        Write-Host "[2/3] Secret '$SecretName' exists — adding a new version"
-        gcloud secrets versions add $SecretName --data-file=$tempFile
+    # ── 3. Create or update the Secret Manager secret ────────────────────────
+    # gcloud.ps1 is itself a PS script so it obeys ErrorActionPreference.
+    # Temporarily silence it for the existence probe only.
+    $ErrorActionPreference = "SilentlyContinue"
+    gcloud secrets describe $SecretName --format="value(name)" 2>$null | Out-Null
+    $secretExists = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = "Stop"
+
+    if ($secretExists) {
+        Write-Host "[2/3] Secret '$SecretName' exists - adding a new version"
+        gcloud secrets versions add $SecretName --data-file="$tempFile"
+        if ($LASTEXITCODE -ne 0) { throw "gcloud secrets versions add failed (exit $LASTEXITCODE)" }
     } else {
         Write-Host "[2/3] Creating secret '$SecretName'"
-        gcloud secrets create $SecretName --data-file=$tempFile --replication-policy="automatic"
+        gcloud secrets create $SecretName --data-file="$tempFile" --replication-policy="automatic"
+        if ($LASTEXITCODE -ne 0) { throw "gcloud secrets create failed (exit $LASTEXITCODE)" }
     }
-
 } finally {
-    # ── 4. Delete temp file regardless of success/failure ────────────────────
+    # ── 4. Always delete the temp file ───────────────────────────────────────
     Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
-    Write-Host "[3/3] Temp file deleted — credentials never persisted locally"
+    Write-Host "[3/3] Temp file deleted - credentials never persisted locally"
 }
 
 # ── 5. Grant dashboard SA read access ────────────────────────────────────────
@@ -85,6 +96,7 @@ Write-Host "Granting secretAccessor to $SaDashboard ..."
 gcloud secrets add-iam-policy-binding $SecretName `
     --member "serviceAccount:$SaDashboard" `
     --role   "roles/secretmanager.secretAccessor"
+if ($LASTEXITCODE -ne 0) { throw "gcloud iam binding failed (exit $LASTEXITCODE)" }
 
 Write-Host ""
 Write-Host "Done. Remember to add '$($DashUrl.TrimEnd('/'))/oauth2callback'"

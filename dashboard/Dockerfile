@@ -5,5 +5,6 @@ COPY dashboard/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src ./src
 COPY dashboard ./dashboard
-# entrypoint.py fetches secrets.toml from Secret Manager, then exec's Streamlit
-CMD ["python", "dashboard/entrypoint.py"]
+CMD exec streamlit run dashboard/app.py \
+    --server.port=${PORT:-8080} --server.address=0.0.0.0 \
+    --server.headless=true --server.enableCORS=false --server.enableXsrfProtection=false

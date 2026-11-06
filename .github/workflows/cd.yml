@@ -61,7 +61,8 @@ jobs:
             --image $REGISTRY/dashboard:${GITHUB_SHA} \
             --service-account sa-dashboard@${PROJECT_ID}.iam.gserviceaccount.com \
             --allow-unauthenticated --min-instances 0 --memory 1Gi \
-            --set-env-vars GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION},MLFLOW_TRACKING_URI=${MLFLOW_URL},API_URL=${API_URL}
+            --set-env-vars GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION},MLFLOW_TRACKING_URI=${MLFLOW_URL},API_URL=${API_URL} \
+            --update-secrets /app/.streamlit/secrets.toml=dashboard-auth-secrets:latest
 
       - name: Health checks
         run: |
