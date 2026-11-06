@@ -57,8 +57,10 @@ $tempFile = [System.IO.Path]::GetTempFileName()
 
 $tomlContent = @"
 [auth]
-redirect_uri          = "$($DashUrl.TrimEnd('/'))/oauth2callback"
-cookie_secret         = "$cookieSecret"
+redirect_uri  = "$($DashUrl.TrimEnd('/'))/oauth2callback"
+cookie_secret = "$cookieSecret"
+
+[auth.default]
 client_id             = "$GoogleClientId"
 client_secret         = "$GoogleClientSecret"
 server_metadata_url   = "https://accounts.google.com/.well-known/openid-configuration"

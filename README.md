@@ -406,10 +406,13 @@ $DASH_ENV = "GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${REGION},MLFLOW_TRACKING_U
 gcloud run deploy dashboard --region $REGION --image "$REGISTRY/dashboard:latest" `
   --service-account $SA_DASHBOARD `
   --allow-unauthenticated --min-instances 0 --memory 1Gi `
-  --set-env-vars $DASH_ENV
+  --set-env-vars $DASH_ENV `
+  --update-secrets /app/.streamlit/secrets.toml=dashboard-auth-secrets:latest
 
 gcloud run services describe dashboard --region $REGION --format "value(status.url)"
 ```
+
+> **Note.** The `--update-secrets` flag mounts the Secret Manager secret directly as `/app/.streamlit/secrets.toml` inside the container (no custom entrypoint needed). The secret must exist before the first deploy — create it in Step 10b §3.
 
 Test the API. First get an identity token, tell the API to load the champion model, and check its health:
 
@@ -485,28 +488,35 @@ $DASH_URL = gcloud run services describe dashboard --region $REGION --format "va
 
 ### 3. Store the sign-in settings in Secret Manager
 
+Use the helper script — it generates a random cookie secret, writes a temp file, uploads it to Secret Manager, deletes the local file, and grants the SA access in one go:
+
 ```powershell
-$GOOGLE_CLIENT_ID     = "PASTE_CLIENT_ID"
-$GOOGLE_CLIENT_SECRET = "PASTE_CLIENT_SECRET"
-$b = New-Object byte[] 32
-[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
-$COOKIE_SECRET = [Convert]::ToBase64String($b)
+. .\env.ps1
+$DASH_URL = gcloud run services describe dashboard --region $REGION --format "value(status.url)"
 
-@"
-[auth]
-redirect_uri = "$DASH_URL/oauth2callback"
-cookie_secret = "$COOKIE_SECRET"
-client_id = "$GOOGLE_CLIENT_ID"
-client_secret = "$GOOGLE_CLIENT_SECRET"
-server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
-"@ | Set-Content secrets.toml -Encoding ascii
-
-gcloud secrets create dashboard-auth-secrets --data-file=secrets.toml
-Remove-Item secrets.toml
-gcloud secrets add-iam-policy-binding dashboard-auth-secrets --member "serviceAccount:$SA_DASHBOARD" --role roles/secretmanager.secretAccessor
+.\scripts\setup_auth_secret.ps1 `
+    -GoogleClientId     "PASTE_CLIENT_ID" `
+    -GoogleClientSecret "PASTE_CLIENT_SECRET" `
+    -DashUrl            $DASH_URL `
+    -SaDashboard        $SA_DASHBOARD
 ```
 
-Never keep or commit `secrets.toml`. To change the settings later: `gcloud secrets versions add dashboard-auth-secrets --data-file=secrets.toml`, then redeploy.
+The script creates (or updates) the `dashboard-auth-secrets` secret with the correct structure:
+
+```toml
+[auth]
+redirect_uri  = "https://<dash-url>/oauth2callback"
+cookie_secret = "<random-32-byte-base64>"
+
+[auth.default]
+client_id           = "<your-client-id>"
+client_secret       = "<your-client-secret>"
+server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+```
+
+> **Important.** The section must be `[auth.default]` (not `[auth.google]`). `st.login()` called without arguments looks for the `default` provider. A flat `[auth]`-only structure or `[auth.google]` causes a 500 / missing-keys error.
+
+The `secrets.toml` file is never written inside the repo and is deleted immediately after upload. To rotate credentials later, just re-run the script — it adds a new secret version automatically.
 
 ### 4. Update the code
 
